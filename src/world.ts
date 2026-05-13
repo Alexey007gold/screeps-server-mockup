@@ -25,6 +25,8 @@ interface AddBotOptions {
     active?: number;
     spawnName?: string;
     modules?: {};
+    guiBot?: boolean;
+    badge?: object | null;
 }
 
 // Terrain string for room completely filled with walls
@@ -198,7 +200,7 @@ export default class World {
     /**
         Add a new user to the world
     */
-    async addBot({ username, room, x, y, gcl = 1, cpu = 100, cpuAvailable = 10000, active = 10000, spawnName = 'Spawn1', modules = {} }: AddBotOptions) {
+    async addBot({ username, room, x, y, gcl = 1, cpu = 100, cpuAvailable = 10000, active = 10000, spawnName = 'Spawn1', modules = {}, guiBot = false, badge = null }: AddBotOptions) {
         const { C, db, env } = await this.load();
         // Ensure that there is a controller in requested room
         const data = await db['rooms.objects'].findOne({ $and: [{ room }, { type: 'controller' }] });
@@ -217,6 +219,7 @@ export default class World {
             db['rooms.objects'].update({ room, type: 'controller' }, { $set: { user: user._id, level: 1, progress: 0, downgradeTime: null, safeMode: 20000 } }),
             db['rooms.objects'].insert({ room, type: 'spawn', x, y, user: user._id, name: spawnName, store : { energy: C.SPAWN_ENERGY_START }, storeCapacityResource: { energy: C.SPAWN_ENERGY_CAPACITY }, hits: C.SPAWN_HITS, hitsMax: C.SPAWN_HITS, spawning: null, notifyWhenAttacked: true }),
         ]);
+        if (guiBot) this.server._registerGuiBot(username, badge);
         // Subscribe to console notification and return emitter
         return new User(this.server, user).init();
     }

@@ -13,12 +13,28 @@ const driver = require('@screeps/driver');
 const ASSETS_PATH = path.join(__dirname, '..', '..', 'assets');
 const MOD_FILE = 'mods.json';
 const DB_FILE = 'db.json';
+const ROOM_HISTORY_MOD_FILE = 'room-history.cjs';
+
+export interface ScreepServerGuiOptions {
+    port?: number;
+    host?: string;
+}
 
 export interface ScreepServerOptions {
     path: string;
     logdir: string;
-    port : number;
+    port: number;
     modfile?: string;
+    /** Start @screeps/backend HTTP server so the desktop client can connect. */
+    gui?: boolean | ScreepServerGuiOptions;
+    /** Enable room history recording so the GUI client can replay room states. */
+    enableHistory?: boolean;
+    /** Directory to store room history chunks. Default: <path>/room-history. */
+    historyDir?: string;
+    /** Maximum ticks of history to retain per room. 0 = unlimited. Default: 0. */
+    preserveLastNTicks?: number;
+    /** Path to a custom db.json to use as the initial database instead of the built-in asset. */
+    db?: string;
 }
 
 export default class ScreepsServer extends EventEmitter {
@@ -29,11 +45,14 @@ export default class ScreepsServer extends EventEmitter {
     connected: boolean;
     processes: {[name: string]: cp.ChildProcess};
     world: World;
+    opts: ScreepServerOptions;
+
+    _guiBotUsernames: string[];
+    _guiBotBadges: Record<string, object>;
+    private _guiSteamId?: string;
 
     private usersQueue?: any;
     private roomsQueue?: any;
-
-    private opts: ScreepServerOptions;
 
     /*
         Constructor.
@@ -46,6 +65,8 @@ export default class ScreepsServer extends EventEmitter {
         this.constants = this.config.common.constants;
         this.connected = false;
         this.processes = {};
+        this._guiBotUsernames = [];
+        this._guiBotBadges = {};
         this.world = new World(this);
         this.opts = this.computeDefaultOpts(opts);
     }
@@ -53,16 +74,20 @@ export default class ScreepsServer extends EventEmitter {
     /*
         Define server options and set defaults.
     */
-    private computeDefaultOpts(opts: Partial<ScreepServerOptions>) {
-        // Assign options
+    private computeDefaultOpts(opts: Partial<ScreepServerOptions>): ScreepServerOptions {
+        // When GUI is enabled the HTTP server claims 21025, so storage must use a different port.
+        const defaultStoragePort = opts.gui ? 21028 : 21025;
         const defaults: ScreepServerOptions = {
             path:   path.resolve('server'),
             logdir: path.resolve('server', 'logs'),
             modfile: path.resolve('server', MOD_FILE),
-            port:   21025,
+            port:   defaultStoragePort,
         };
 
-        const options = _.defaults(opts, defaults);
+        const options = _.defaults(opts, defaults) as ScreepServerOptions;
+        if (!options.historyDir) {
+            options.historyDir = path.resolve(options.path, 'room-history');
+        }
         // Define environment parameters
         process.env.MODFILE = options.modfile;
         process.env.DRIVER_MODULE = '@screeps/driver';
@@ -85,6 +110,26 @@ export default class ScreepsServer extends EventEmitter {
         return this.opts;
     }
 
+    get guiSteamId(): string | undefined {
+        return this._guiSteamId;
+    }
+
+    /*
+        Register a bot username as a GUI bot (links it to the local Steam account).
+        badge is optional; if provided it is stored alongside the Steam link.
+        - greenworks mode: Steam ID already known — update DB immediately.
+        - STEAM_KEY mode: Steam ID unknown — enqueue for the _onSteamId hook.
+    */
+    _registerGuiBot(username: string, badge?: object | null) {
+        this._guiBotUsernames.push(username);
+        if (badge) this._guiBotBadges[username] = badge;
+        if (this._guiSteamId) {
+            const $set: any = { steam: { id: this._guiSteamId } };
+            if (badge) $set.badge = badge;
+            return common.storage.db['users'].update({ username }, { $set });
+        }
+    }
+
     /*
         Start storage process and connect driver.
     */
@@ -93,10 +138,21 @@ export default class ScreepsServer extends EventEmitter {
         await fs.mkdirAsync(this.opts.path).catch(() => {});
         await fs.mkdirAsync(this.opts.logdir).catch(() => {});
         // Copy assets into server directory
+        const dbSource = this.opts.db ? path.resolve(this.opts.db) : path.join(ASSETS_PATH, DB_FILE);
         await Promise.all([
-            fs.copyAsync(path.join(ASSETS_PATH, DB_FILE), path.join(this.opts.path, DB_FILE)),
+            fs.copyAsync(dbSource, path.join(this.opts.path, DB_FILE)),
             fs.copyAsync(path.join(ASSETS_PATH, MOD_FILE), path.join(this.opts.path, MOD_FILE)),
         ]);
+        if (this.opts.enableHistory) {
+            await fs.mkdirAsync(this.opts.historyDir!).catch(() => {});
+            await fs.copyAsync(path.join(ASSETS_PATH, ROOM_HISTORY_MOD_FILE), path.join(this.opts.path, ROOM_HISTORY_MOD_FILE));
+            const modsPath = path.resolve(this.opts.path, MOD_FILE);
+            const modsJson = JSON.parse(await fs.readFileAsync(modsPath, 'utf8') as string);
+            if (!modsJson.mods.includes(ROOM_HISTORY_MOD_FILE)) {
+                modsJson.mods.push(ROOM_HISTORY_MOD_FILE);
+            }
+            await fs.writeFileAsync(modsPath, JSON.stringify(modsJson, null, '\t'));
+        }
         // Start storage process
         this.emit('info', 'Starting storage process.');
         const library = path.resolve(path.dirname(require.resolve('@screeps/storage')), '../bin/start.js');
@@ -110,7 +166,7 @@ export default class ScreepsServer extends EventEmitter {
             process.on('message', (message) => {
                 if (message === 'storageLaunched') {
                     clearTimeout(timeout);
-                    resolve();
+                    resolve(undefined);
                 }
             });
         });
@@ -124,7 +180,7 @@ export default class ScreepsServer extends EventEmitter {
             this.roomsQueue = await driver.queue.create('rooms');
             this.connected = true;
         } catch (err) {
-            throw new Error(`Error connecting to driver: ${err.stack}`);
+            throw new Error(`Error connecting to driver: ${(err as any).stack}`);
         }
         return this;
     }
@@ -187,27 +243,122 @@ export default class ScreepsServer extends EventEmitter {
         this.emit('info', 'Starting engine processes.');
         this.startProcess('engine_runner', path.resolve(path.dirname(require.resolve('@screeps/engine')), 'runner.js'), {
             DRIVER_MODULE: '@screeps/driver',
-            MODFILE:       path.resolve(this.opts.path, DB_FILE),
+            MODFILE:       path.resolve(this.opts.path, MOD_FILE),
             STORAGE_PORT:  `${this.opts.port}`,
         });
         this.startProcess('engine_processor', path.resolve(path.dirname(require.resolve('@screeps/engine')), 'processor.js'), {
             DRIVER_MODULE: '@screeps/driver',
-            MODFILE:       path.resolve(this.opts.path, DB_FILE),
+            MODFILE:       path.resolve(this.opts.path, MOD_FILE),
             STORAGE_PORT:  `${this.opts.port}`,
+            ...(this.opts.enableHistory && {
+                HISTORY_DIR:            this.opts.historyDir,
+                HISTORY_PRESERVE_TICKS: String(this.opts.preserveLastNTicks || 0),
+            }),
         });
 
         // Need to pre-initiailize the Room Status cache
         await driver.updateAccessibleRoomsList();
         await driver.updateRoomStatusData();
 
+        if (this.opts.gui) {
+            await this._startGuiServer();
+        }
+
         return this;
+    }
+
+    /*
+        Start the @screeps/backend HTTP server so the desktop client can connect.
+        gui option: true | { port?: number; host?: string }
+    */
+    private async _startGuiServer() {
+        const gui = typeof this.opts.gui === 'object' ? this.opts.gui : {} as ScreepServerGuiOptions;
+        const gamePort = gui.port || 21025;
+        const gameHost = gui.host || '0.0.0.0';
+
+        process.env.GAME_PORT = String(gamePort);
+        process.env.GAME_HOST = gameHost;
+        process.env.CLI_PORT  = String(gamePort + 1);
+        process.env.CLI_HOST  = '127.0.0.1';
+        process.env.ASSET_DIR = this.opts.path;
+        process.env.MODFILE   = path.resolve(this.opts.path, MOD_FILE);
+
+        const backend: any = require('@screeps/backend');
+        common.configManager.config.backend.welcomeText = '';
+        try {
+            const gwPath = path.resolve(path.dirname(backend), '../greenworks/greenworks');
+            const gw = require(gwPath);
+            if (gw.isSteamRunning() && gw.initAPI()) {
+                this._guiSteamId = gw.getSteamId().getRawSteamID();
+                gw.initAPI = () => true;
+            }
+        } catch (_e) {
+            // no greenworks — STEAM_KEY mode, Steam ID unknown
+        }
+
+        if (!this._guiSteamId) {
+            const serverRef = this;
+            common.configManager.config.backend._onSteamId = function(steamId: string) {
+                common.configManager.config.backend._onSteamId = null;
+                serverRef._guiSteamId = steamId;
+                const usernames = serverRef._guiBotUsernames;
+                return common.storage.db['users']
+                    .find({ username: { $in: usernames } })
+                    .then((users: any[]) => Promise.all(
+                        users.map((u: any) => {
+                            const $set: any = { steam: { id: steamId } };
+                            const badge = serverRef._guiBotBadges[u.username];
+                            if (badge) $set.badge = badge;
+                            return common.storage.db['users'].update({ _id: u._id }, { $set });
+                        })
+                    ));
+            };
+        }
+
+        if (this.opts.enableHistory) {
+            const nativeFs = require('fs');
+            const histDir = this.opts.historyDir;
+            common.configManager.config.backend.onGetRoomHistory = function(roomName: string, baseTime: string, callback: (err: any, data?: any) => void) {
+                const roomDir = path.resolve(histDir!, roomName);
+                nativeFs.readFile(path.resolve(roomDir, baseTime + '.json'), { encoding: 'utf8' }, (err: any, data: string) => {
+                    if (!err) return callback(null, data);
+                    nativeFs.readdir(roomDir, (err2: any, files: string[]) => {
+                        if (err2) return callback(err);
+                        const requestedBase = parseInt(baseTime, 10);
+                        const best = files
+                            .filter((f: string) => /^\d+\.json$/.test(f))
+                            .map((f: string) => parseInt(f, 10))
+                            .filter((t: number) => t <= requestedBase)
+                            .sort((a: number, b: number) => b - a)[0];
+                        if (best == null) return callback(err);
+                        nativeFs.readFile(path.resolve(roomDir, best + '.json'), { encoding: 'utf8' }, callback);
+                    });
+                });
+            };
+            this.emit('info', `Room history enabled, writing to: ${histDir}`);
+        }
+
+        const startPromise = backend.start();
+        this.emit('info', `GUI server: http://localhost:${gamePort} (Steam ID: ${this._guiSteamId || 'pending first sign-in'})`);
+        return startPromise;
     }
 
     /*
         Stop most processes (it is not perfect though as some remain).
     */
-    stop() {
-        _.each(this.processes, (process) => process.kill());
-        return this;
+    stop(): Promise<any> {
+        const procs = Object.values(this.processes);
+        _.each(this.processes, (proc) => proc.kill());
+        const procsDone = Promise.all(procs.map((proc) =>
+            new Promise<void>((resolve) => {
+                if ((proc as any).exitCode !== null) { resolve(); return; }
+                proc.once('exit', resolve);
+            })
+        ));
+        if (this.opts.gui) {
+            const backend: any = require('@screeps/backend');
+            return Promise.all([procsDone, backend.stop()]);
+        }
+        return procsDone;
     }
 }
