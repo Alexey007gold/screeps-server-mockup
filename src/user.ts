@@ -20,6 +20,7 @@ export default class User extends EventEmitter {
     private _id: string;
     private _username: string;
     private _server: ScreepsServer;
+    private _lastLogs: string[];
 
     /**
         Constructor
@@ -30,6 +31,7 @@ export default class User extends EventEmitter {
         this._username = data.username;
         this._server = server;
         this.knownNotifications = [];
+        this._lastLogs = [];
     }
 
     /**
@@ -59,6 +61,13 @@ export default class User extends EventEmitter {
     get memory(): Promise<string> {
         const { env } = this._server.common.storage;
         return env.get(env.keys.MEMORY + this.id);
+    }
+    async setMemory(value: string): Promise<void> {
+        const { env } = this._server.common.storage;
+        return env.set(env.keys.MEMORY + this.id, value);
+    }
+    get logs(): Promise<string[]> {
+        return Promise.resolve(this._lastLogs || []);
     }
     get notifications(): Promise<Notification[]> {
         const { db } = this._server.common.storage;
@@ -112,6 +121,7 @@ export default class User extends EventEmitter {
         await pubsub.subscribe(`user:${this._id}/console`, (event: any) => {
             const { messages } = JSON.parse(event);
             const { log = [], results = [] } = messages || {};
+            this._lastLogs = log;
             this.emit('console', log, results, this._id, this.username);
         });
         return this;
