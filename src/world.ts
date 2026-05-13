@@ -2,8 +2,17 @@ import * as _ from 'lodash';
 import * as util from 'util';
 import * as zlib from 'zlib';
 import TerrainMatrix from './terrainMatrix';
-import User, { UserBadge } from './user';
+import User, {UserBadge} from './user';
 import ScreepsServer from './screepsServer';
+
+export interface RoomSnapshot {
+    mainRoom: string;
+    gameTime: number;
+    rooms: Record<string, { terrain: string; objects: any[] }>;
+    users: any[];
+    options: Record<string, any>;
+    memories?: Record<string, Record<string, any>>;
+}
 
 interface AddBotOptions {
     username: string;
@@ -208,8 +217,78 @@ export default class World {
             db['rooms.objects'].update({ room, type: 'controller' }, { $set: { user: user._id, level: 1, progress: 0, downgradeTime: null, safeMode: 20000 } }),
             db['rooms.objects'].insert({ room, type: 'spawn', x, y, user: user._id, name: spawnName, store : { energy: C.SPAWN_ENERGY_START }, storeCapacityResource: { energy: C.SPAWN_ENERGY_CAPACITY }, hits: C.SPAWN_HITS, hitsMax: C.SPAWN_HITS, spawning: null, notifyWhenAttacked: true }),
         ]);
-        // Subscribe to console notificaiton and return emitter
+        // Subscribe to console notification and return emitter
         return new User(this.server, user).init();
+    }
+
+    async captureSnapshot(mainRoom: string, options: Record<string, any> = {}): Promise<RoomSnapshot> {
+        const { db, env } = await this.load();
+        const gameTime = await env.get(env.keys.GAMETIME);
+        const allRoomDocs = await db.rooms.find();
+
+        const rooms: Record<string, { terrain: string; objects: any[] }> = {};
+        for (const roomDoc of allRoomDocs) {
+            const rName = roomDoc._id;
+            let rObjects: any[] = [];
+            try { rObjects = await this.roomObjects(rName); } catch (_) {}
+            rooms[rName] = { terrain: (await this.getTerrain(rName)).serialize(), objects: rObjects };
+        }
+
+        const allUserDocs = await db.users.find();
+        const botUsers = allUserDocs.filter((u: any) => !['1', '2', '3'].includes(u._id));
+        const guiBadges: Record<string, object> = (this.server as any)._guiBotBadges || {};
+        const users = botUsers.map(({ $loki: _l, meta: _m, ...u }: any) => {
+            const badge = u.badge ?? guiBadges[u.username] ?? null;
+            return badge ? { ...u, badge } : u;
+        });
+
+        const memories: Record<string, Record<string, any>> = {};
+        for (const u of botUsers) {
+            try {
+                const raw = await env.get(env.keys.MEMORY + u._id);
+                if (raw) memories[u.username] = JSON.parse(raw);
+            } catch (_) {}
+        }
+
+        return { mainRoom, gameTime, rooms, users, options, memories };
+    }
+
+    async restoreSnapshot(snapshot: RoomSnapshot, modules: Record<string, string>): Promise<User[]> {
+        const { mainRoom, rooms: allRooms, gameTime, memories: savedMemories } = snapshot;
+
+        await this.reset();
+
+        for (const [roomName, roomData] of Object.entries(allRooms)) {
+            await this.addRoom(roomName);
+            await this.setTerrain(roomName, TerrainMatrix.unserialize(roomData.terrain));
+        }
+
+        const { db, env } = await this.load();
+
+        await env.set(env.keys.GAMETIME, gameTime);
+        await db.rooms.update({ _id: mainRoom }, { $set: { active: true } });
+
+        const bots: User[] = [];
+        for (const userRec of snapshot.users) {
+            const { $loki: _l, meta: _m, ...attrs } = userRec;
+            await db.users.insert(attrs);
+            await db['users.code'].insert({ user: attrs._id, branch: 'default', modules, activeWorld: true });
+            await env.set(env.keys.MEMORY + attrs._id, '{}');
+            this.server._registerGuiBot(attrs.username, attrs.badge ?? null);
+            const bot = await new User(this.server, attrs).init();
+            const userMemory = savedMemories?.[attrs.username];
+            if (userMemory) await bot.setMemory(JSON.stringify(userMemory));
+            bots.push(bot);
+        }
+
+        for (const roomData of Object.values(allRooms)) {
+            for (const obj of roomData.objects) {
+                const { $loki: _l, meta: _m, ...attrs } = obj;
+                await db['rooms.objects'].insert(attrs);
+            }
+        }
+
+        return bots;
     }
 
     private async updateEnvTerrain(db: any, env: any) {
