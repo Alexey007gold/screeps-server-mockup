@@ -21,6 +21,7 @@ export default class User extends EventEmitter {
     private _username: string;
     private _server: ScreepsServer;
     private _lastLogs: string[];
+    private _lastError?: string;
 
     /**
         Constructor
@@ -68,6 +69,9 @@ export default class User extends EventEmitter {
     }
     get logs(): Promise<string[]> {
         return Promise.resolve(this._lastLogs || []);
+    }
+    get error(): Promise<string | undefined> {
+        return Promise.resolve(this._lastError || undefined);
     }
     get notifications(): Promise<Notification[]> {
         const { db } = this._server.common.storage;
@@ -122,6 +126,7 @@ export default class User extends EventEmitter {
             const { messages, error } = JSON.parse(event);
             const { log = [], results = [] } = messages || {};
             this._lastLogs = log;
+            this._lastError = error;
             if (error) {
                 console.error(error);
             }

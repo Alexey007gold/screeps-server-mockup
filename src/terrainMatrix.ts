@@ -24,11 +24,7 @@ export default class Matrix {
         Setters
     */
     set(x: number, y: number, value: TerrainTypes): this {
-        if (TYPES.includes(value)) {
-            _.set(this.data, `${x}:${y}`, value);
-        } else {
-            throw new Error(`invalid value ${value}`);
-        }
+        _.set(this.data, `${x}:${y}`, value);
         return this;
     }
 
@@ -56,13 +52,23 @@ export default class Matrix {
     */
     static unserialize(str: string): Matrix {
         const matrix = new Matrix();
-        _.each(str.split(''), (mask, idx) => {
+        _.each(str.split(''), (char, idx) => {
             const x = idx % 50;
             const y = Math.floor(idx / 50);
-            const terrain = _.get(TYPES, mask);
-            if (terrain == null) {
-                throw new Error(`invalid terrain mask: ${mask}`);
-            } else if (terrain !== 'plain') {
+            const bits = parseInt(char, 10);
+            if (isNaN(bits)) {
+                throw new Error(`invalid terrain mask: ${char}`);
+            }
+            // Use bitwise decode: MASK_WALL=1 takes priority over TERRAIN_MASK_SWAMP=2
+            let terrain: TerrainTypes;
+            if (bits & 1) {
+                terrain = 'wall';
+            } else if (bits & 2) {
+                terrain = 'swamp';
+            } else {
+                terrain = 'plain';
+            }
+            if (terrain !== 'plain') {
                 matrix.set(x, y, terrain);
             }
         });
