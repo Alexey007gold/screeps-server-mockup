@@ -119,9 +119,12 @@ export default class User extends EventEmitter {
     async init() {
         const { pubsub } = this._server.common.storage;
         await pubsub.subscribe(`user:${this._id}/console`, (event: any) => {
-            const { messages } = JSON.parse(event);
+            const { messages, error } = JSON.parse(event);
             const { log = [], results = [] } = messages || {};
             this._lastLogs = log;
+            if (error) {
+                console.error(error);
+            }
             this.emit('console', log, results, this._id, this.username);
         });
         return this;
