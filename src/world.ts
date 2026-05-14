@@ -1,8 +1,11 @@
 import * as _ from 'lodash';
 import * as util from 'util';
 import * as zlib from 'zlib';
+import * as fs from 'fs';
+import * as path from 'path';
+import { PNG } from 'pngjs';
 import TerrainMatrix from './terrainMatrix';
-import User, {UserBadge} from './user';
+import User, { UserBadge } from './user';
 import ScreepsServer from './screepsServer';
 
 export interface RoomSnapshot {
@@ -222,6 +225,104 @@ export default class World {
         if (guiBot) this.server._registerGuiBot(username, badge);
         // Subscribe to console notification and return emitter
         return new User(this.server, user).init();
+    }
+
+    /**
+        Generate map PNG assets for all rooms with terrain data:
+          map/<room>.png        — 150×150 (3px/cell) used by the old world overview
+          map/zoom2/<tile>.png  — 200×200 merged 4×4-room tile used by new map visuals
+        Both are served by the backend at /assets/map/...
+    */
+    async generateMapImages() {
+        const { db } = this.server.common.storage;
+        const mapDir = path.resolve(this.server.opts.path, 'map');
+        const zoom2Dir = path.resolve(mapDir, 'zoom2');
+        if (!fs.existsSync(mapDir))  fs.mkdirSync(mapDir,  { recursive: true });
+        if (!fs.existsSync(zoom2Dir)) fs.mkdirSync(zoom2Dir, { recursive: true });
+
+        const WALL = 1, SWAMP = 2;
+
+        function roomToXY(name: string): [number, number] {
+            const m = name.match(/^([WE])(\d+)([NS])(\d+)$/);
+            if (!m) throw new Error(`invalid room name: ${name}`);
+            const [, hor, xs, ver, ys] = m;
+            return [hor === 'W' ? -Number(xs) - 1 : Number(xs),
+                    ver === 'N' ? -Number(ys) - 1 : Number(ys)];
+        }
+
+        function xyToRoom(x: number, y: number): string {
+            return `${x < 0 ? 'W' + (-x - 1) : 'E' + x}${y < 0 ? 'N' + (-y - 1) : 'S' + y}`;
+        }
+
+        function renderRoom(serial: string, cellSize: number): Buffer {
+            const W = 50 * cellSize;
+            const buf = Buffer.alloc(W * W * 4);
+            for (let cy = 0; cy < 50; cy++) {
+                for (let cx = 0; cx < 50; cx++) {
+                    const mask = parseInt(serial[cy * 50 + cx], 10);
+                    let r, g, b;
+                    if (mask & WALL)       { r = 0;  g = 0;  b = 0;  }
+                    else if (mask & SWAMP) { r = 35; g = 37; b = 19; }
+                    else if (cx === 0 || cy === 0 || cx === 49 || cy === 49) { r = 50; g = 50; b = 50; }
+                    else                   { r = 43; g = 43; b = 43; }
+                    for (let dy = 0; dy < cellSize; dy++) {
+                        for (let dx = 0; dx < cellSize; dx++) {
+                            const idx = ((cy * cellSize + dy) * W + (cx * cellSize + dx)) << 2;
+                            buf[idx] = r; buf[idx + 1] = g; buf[idx + 2] = b; buf[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+            return buf;
+        }
+
+        function writePng(data: Buffer, size: number, filePath: string): Promise<void> {
+            return new Promise((resolve, reject) => {
+                const png = new PNG({ width: size, height: size });
+                png.data = data;
+                png.pack().pipe(fs.createWriteStream(filePath))
+                    .on('finish', resolve).on('error', reject);
+            });
+        }
+
+        const terrainDocs: Array<{ room: string; terrain: string }> = await db['rooms.terrain'].find();
+        const byRoom = new Map(terrainDocs.map((d: { room: string; terrain: string }) => [d.room, d.terrain]));
+
+        // 1. Per-room 150×150 thumbnails
+        const roomPngs = terrainDocs.map(({ room, terrain }: { room: string; terrain: string }) =>
+            writePng(renderRoom(terrain, 3), 150, path.resolve(mapDir, `${room}.png`))
+        );
+
+        // 2. Zoom2 4×4 merged tiles (200×200, 1px/cell per room)
+        const tiles = new Map<string, { tx: number; ty: number; rooms: Array<{ room: string; x: number; y: number }> }>();
+        for (const room of byRoom.keys()) {
+            const [x, y] = roomToXY(room);
+            const tx = Math.floor(x / 4) * 4;
+            const ty = Math.floor(y / 4) * 4;
+            const key = `${tx},${ty}`;
+            if (!tiles.has(key)) tiles.set(key, { tx, ty, rooms: [] });
+            tiles.get(key)!.rooms.push({ room, x, y });
+        }
+
+        const zoom2Pngs = [...tiles.values()].map(({ tx, ty, rooms: tileRooms }) => {
+            const buf = Buffer.alloc(200 * 200 * 4);
+            for (const { room, x, y } of tileRooms) {
+                const serial = byRoom.get(room)!;
+                const ox = (x - tx) * 50, oy = (y - ty) * 50;
+                const src = renderRoom(serial, 1);
+                for (let py = 0; py < 50; py++) {
+                    for (let px = 0; px < 50; px++) {
+                        const si = (py * 50 + px) << 2;
+                        const di = ((oy + py) * 200 + (ox + px)) << 2;
+                        buf[di] = src[si]; buf[di+1] = src[si+1];
+                        buf[di+2] = src[si+2]; buf[di+3] = src[si+3];
+                    }
+                }
+            }
+            return writePng(buf, 200, path.resolve(zoom2Dir, `${xyToRoom(tx, ty)}.png`));
+        });
+
+        await Promise.all([...roomPngs, ...zoom2Pngs]);
     }
 
     async captureSnapshot(mainRoom: string, options: Record<string, any> = {}): Promise<RoomSnapshot> {
