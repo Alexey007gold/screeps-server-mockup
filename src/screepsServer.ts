@@ -76,7 +76,7 @@ export default class ScreepsServer extends EventEmitter {
     */
     private computeDefaultOpts(opts: Partial<ScreepServerOptions>): ScreepServerOptions {
         // When GUI is enabled the HTTP server claims 21025, so storage must use a different port.
-        const defaultStoragePort = opts.gui ? 21028 : 21025;
+        const defaultStoragePort = opts.gui ? 21027 : 21025;
         const defaults: ScreepServerOptions = {
             path:   path.resolve('server'),
             logdir: path.resolve('server', 'logs'),
