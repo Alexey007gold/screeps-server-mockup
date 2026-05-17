@@ -347,18 +347,34 @@ export default class ScreepsServer extends EventEmitter {
         Stop most processes (it is not perfect though as some remain).
     */
     stop(): Promise<any> {
-        const procs = Object.values(this.processes);
-        _.each(this.processes, (proc) => proc.kill());
-        const procsDone = Promise.all(procs.map((proc) =>
+        const engineProcs = Object.entries(this.processes)
+            .filter(([name]) => name !== 'storage')
+            .map(([, proc]) => proc);
+        engineProcs.forEach(p => p.kill());
+        const enginesDone = Promise.all(engineProcs.map(proc =>
             new Promise<void>((resolve) => {
                 if ((proc as any).exitCode !== null) { resolve(); return; }
                 proc.once('exit', resolve);
             })
         ));
+
         if (this.opts.gui) {
             const backend: any = require('@screeps/backend');
-            return Promise.all([procsDone, backend.stop()]);
+            return Promise.all([enginesDone.then(() => this.stopStorage()), backend.stop()]);
         }
-        return procsDone;
+        return enginesDone.then(() => this.stopStorage());
+    }
+
+    private stopStorage(): Promise<void> {
+        const storageProc = this.processes['storage'];
+        if (!storageProc) return Promise.resolve();
+        const storage = this.common.storage as any;
+        storage._socket?.destroy();
+        storage._connected = false;
+        storageProc.kill();
+        return new Promise<void>((resolve) => {
+            if ((storageProc as any).exitCode !== null) { resolve(); return; }
+            storageProc.once('exit', resolve);
+        });
     }
 }
