@@ -118,6 +118,18 @@ export default class User extends EventEmitter {
     }
 
     /**
+        Generate a short-lived auth token that can pre-populate localStorage.auth
+        in the steamless client. The token is valid for 24 h and rolls automatically
+        once the game client makes its first authenticated request.
+    */
+    async getToken(): Promise<string> {
+        const { env } = this._server.common.storage;
+        const token = 'qwerty';
+        await env.set(`auth_${token}`, this._id);
+        return token;
+    }
+
+    /**
         Initialise console events
     */
     async init() {
