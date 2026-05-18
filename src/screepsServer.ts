@@ -338,6 +338,18 @@ export default class ScreepsServer extends EventEmitter {
             this.emit('info', `Room history enabled, writing to: ${histDir}`);
         }
 
+        common.configManager.config.backend.once('expressPreConfig', (app: any) => {
+            app.use((req: any, res: any, next: any) => {
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                if (req.method === 'OPTIONS') {
+                    res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
+                    res.status(204).end();
+                    return;
+                }
+                next();
+            });
+        });
+
         const startPromise = backend.start();
         this.emit('info', `GUI server: http://localhost:${gamePort} (Steam ID: ${this._guiSteamId || 'pending first sign-in'})`);
         return startPromise;
