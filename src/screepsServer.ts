@@ -203,8 +203,6 @@ export default class ScreepsServer extends EventEmitter {
         await require('@screeps/engine/src/processor/global')();
         await driver.commitDbBulk();
         const gameTime = await driver.incrementGameTime();
-        await driver.updateAccessibleRoomsList();
-        await driver.updateRoomStatusData();
         await driver.notifyRoomsDone(gameTime);
         await (driver.config as any).mainLoopCustomStage();
         return this;
