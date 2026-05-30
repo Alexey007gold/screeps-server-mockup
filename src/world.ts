@@ -357,7 +357,7 @@ export default class World {
         return { mainRoom, gameTime, rooms, users, options, memories };
     }
 
-    async restoreSnapshot(snapshot: RoomSnapshot, modules: Record<string, string>): Promise<User[]> {
+    async restoreSnapshot(snapshot: RoomSnapshot, modules: Record<string, string>, botName: string): Promise<User[]> {
         const { mainRoom, rooms: allRooms, gameTime, memories: savedMemories } = snapshot;
 
         await this.reset();
@@ -376,13 +376,16 @@ export default class World {
         for (const userRec of snapshot.users) {
             const { $loki: _l, meta: _m, ...attrs } = userRec;
             await db.users.insert(attrs);
+
+            let user = new User(this.server, attrs);
+            await user.setMemory(JSON.stringify(savedMemories?.[attrs.username] ?? {}));
+
+            if (attrs.username !== botName) continue;
+
             await db['users.code'].insert({ user: attrs._id, branch: 'default', modules, activeWorld: true });
-            await env.set(env.keys.MEMORY + attrs._id, '{}');
             this.server._registerGuiBot(attrs.username, attrs.badge ?? null);
-            const bot = await new User(this.server, attrs).init();
-            const userMemory = savedMemories?.[attrs.username];
-            if (userMemory) await bot.setMemory(JSON.stringify(userMemory));
-            bots.push(bot);
+            await user.init();
+            bots.push(user);
         }
 
         for (const roomData of Object.values(allRooms)) {
