@@ -15,6 +15,7 @@ export interface RoomSnapshot {
     users: any[];
     options: Record<string, any>;
     memories?: Record<string, Record<string, any>>;
+    segments?: Record<string, Record<number, string>>;
 }
 
 interface AddBotOptions {
@@ -354,11 +355,22 @@ export default class World {
             } catch (_) {}
         }
 
-        return { mainRoom, gameTime, rooms, users, options, memories };
+        const allSegmentIndices = Array.from({ length: 100 }, (_, i) => i);
+        const segments: Record<string, Record<number, string>> = {};
+        for (const u of botUsers) {
+            try {
+                const values: (string | null)[] = await env.hmget(env.keys.MEMORY_SEGMENTS + u._id, allSegmentIndices);
+                const userSegments: Record<number, string> = {};
+                values.forEach((val, idx) => { if (val != null) userSegments[idx] = val; });
+                if (Object.keys(userSegments).length > 0) segments[u.username] = userSegments;
+            } catch (_) {}
+        }
+
+        return { mainRoom, gameTime, rooms, users, options, memories, segments };
     }
 
     async restoreSnapshot(snapshot: RoomSnapshot, modules: Record<string, string>, botName: string): Promise<User[]> {
-        const { mainRoom, rooms: allRooms, gameTime, memories: savedMemories } = snapshot;
+        const { mainRoom, rooms: allRooms, gameTime, memories: savedMemories, segments: savedSegments } = snapshot;
 
         await this.reset();
 
@@ -379,6 +391,10 @@ export default class World {
 
             let user = new User(this.server, attrs);
             await user.setMemory(JSON.stringify(savedMemories?.[attrs.username] ?? {}));
+            const userSegments = savedSegments?.[attrs.username];
+            if (userSegments && Object.keys(userSegments).length > 0) {
+                await env.hmset(env.keys.MEMORY_SEGMENTS + attrs._id, userSegments);
+            }
 
             if (attrs.username !== botName) continue;
 
