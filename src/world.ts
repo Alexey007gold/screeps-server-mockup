@@ -327,6 +327,38 @@ export default class World {
         await Promise.all([...roomPngs, ...zoom2Pngs]);
     }
 
+    /**
+        Persist the full storage database (every collection incl. env with
+        gameTime/memory/segments) and copy it to outPath. The resulting file has
+        the same format as the `db` server option, so a server started with
+        `new ScreepsServer({db: outPath})` resumes the world with full fidelity.
+        Requires the storage process to be running (i.e. after server.connect()).
+    */
+    async saveDb(outPath: string): Promise<string> {
+        const proc = this.server.processes['storage'];
+        if (!proc) {
+            throw new Error('cannot save db: storage process is not running');
+        }
+        await new Promise<void>((resolve, reject) => {
+            const onMessage = (message: any) => {
+                if (!message || message.cmd !== 'dbSaved') return;
+                clearTimeout(timeout);
+                proc.removeListener('message', onMessage);
+                if (message.error) reject(new Error(`saveDb failed: ${message.error}`));
+                else resolve();
+            };
+            const timeout = setTimeout(() => {
+                proc.removeListener('message', onMessage);
+                reject(new Error('saveDb timed out waiting for storage process ack'));
+            }, 10000);
+            proc.on('message', onMessage);
+            proc.send('saveDb');
+        });
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.copyFileSync(path.resolve(this.server.opts.path, 'db.json'), outPath);
+        return outPath;
+    }
+
     async captureSnapshot(mainRoom: string, options: Record<string, any> = {}): Promise<RoomSnapshot> {
         const { db, env } = await this.load();
         const gameTime = await env.get(env.keys.GAMETIME);
