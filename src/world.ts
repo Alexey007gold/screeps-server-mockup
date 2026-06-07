@@ -11,7 +11,8 @@ import ScreepsServer from './screepsServer';
 export interface RoomSnapshot {
     mainRoom: string;
     gameTime: number;
-    rooms: Record<string, { terrain: string; objects: any[] }>;
+    /** info: extra db.rooms doc fields (bus, depositType, sourceKeepers, …) minus _id/active/bookkeeping. */
+    rooms: Record<string, { terrain: string; objects: any[]; info?: Record<string, any> }>;
     users: any[];
     options: Record<string, any>;
     memories?: Record<string, Record<string, any>>;
@@ -336,7 +337,8 @@ export default class World {
             const rName = roomDoc._id;
             let rObjects: any[] = [];
             try { rObjects = await this.roomObjects(rName); } catch (_) {}
-            rooms[rName] = { terrain: (await this.getTerrain(rName)).serialize(), objects: rObjects };
+            const { _id: _i, $loki: _l, meta: _m, active: _a, nextForceUpdateTime: _n, ...info } = roomDoc;
+            rooms[rName] = { terrain: (await this.getTerrain(rName)).serialize(), objects: rObjects, info };
         }
 
         const allUserDocs = await db.users.find();
@@ -374,12 +376,21 @@ export default class World {
 
         await this.reset();
 
+        const { db, env } = await this.load();
+
         for (const [roomName, roomData] of Object.entries(allRooms)) {
-            await this.addRoom(roomName);
+            // active=false: the engine's room processor re-activates any room whose
+            // db.rooms doc has a truthy `active` flag on EVERY tick (and the flag can
+            // never be cleared because saveRoomInfo uses $set). Marking all rooms
+            // active here would therefore make the server process every room of the
+            // map each tick forever, tanking the tick rate after a snapshot resume.
+            await this.setRoom(roomName, roomData.info?.status ?? 'normal', false);
+            if (roomData.info) {
+                // Restore extra room doc fields (bus, depositType, sourceKeepers, …)
+                await db.rooms.update({ _id: roomName }, { $set: roomData.info });
+            }
             await this.setTerrain(roomName, TerrainMatrix.unserialize(roomData.terrain));
         }
-
-        const { db, env } = await this.load();
 
         await env.set(env.keys.GAMETIME, gameTime);
         await db.rooms.update({ _id: mainRoom }, { $set: { active: true } });
@@ -404,10 +415,17 @@ export default class World {
             bots.push(user);
         }
 
-        for (const roomData of Object.values(allRooms)) {
+        for (const [roomName, roomData] of Object.entries(allRooms)) {
+            let hasUserObjects = false;
             for (const obj of roomData.objects) {
                 const { $loki: _l, meta: _m, ...attrs } = obj;
                 await db['rooms.objects'].insert(attrs);
+                if (attrs.user) hasUserObjects = true;
+            }
+            // One-time kick so occupied rooms are processed from the very first tick;
+            // afterwards the engine's own activation rules keep them in rotation.
+            if (hasUserObjects || roomName === mainRoom) {
+                await env.sadd(env.keys.ACTIVE_ROOMS, roomName);
             }
         }
 
