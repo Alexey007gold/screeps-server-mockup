@@ -18,7 +18,8 @@
     "dist/utils"
   ],
   "dependencies": {
-    "fs-extra-promise": "^1.0.1"
+    "fs-extra-promise": "^1.0.1",
+    "screepsmod-market": "^1.2.0"
   },
   "peerDependencies": {
   },

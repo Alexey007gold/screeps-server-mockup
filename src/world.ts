@@ -364,7 +364,7 @@ export default class World {
         const gameTime = await env.get(env.keys.GAMETIME);
         const allRoomDocs = await db.rooms.find();
 
-        const rooms: Record<string, { terrain: string; objects: any[] }> = {};
+        const rooms: Record<string, { terrain: string; objects: any[]; info: any }> = {};
         for (const roomDoc of allRoomDocs) {
             const rName = roomDoc._id;
             let rObjects: any[] = [];

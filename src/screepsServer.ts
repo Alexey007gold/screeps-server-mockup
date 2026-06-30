@@ -14,6 +14,7 @@ const ASSETS_PATH = path.join(__dirname, '..', '..', 'assets');
 const MOD_FILE = 'mods.json';
 const DB_FILE = 'db.json';
 const ROOM_HISTORY_MOD_FILE = 'room-history.cjs';
+const MARKET_MOD = 'screepsmod-market';
 
 export interface ScreepServerGuiOptions {
     port?: number;
@@ -35,6 +36,15 @@ export interface ScreepServerOptions {
     preserveLastNTicks?: number;
     /** Path to a custom db.json to use as the initial database instead of the built-in asset. */
     db?: string;
+    /**
+     * Load the `screepsmod-market` mod so `config.market` (NPC buy/sell prices and
+     * amounts) is available across the server processes. The mod's NPC-order cron is
+     * gated on the backend, which the mockup does not run on `tick()`, so NPC orders are
+     * NOT created automatically — call `recreateNpcMarketOrders()` to seed them
+     * deterministically. Player/NPC `deal` and order intents are processed natively by
+     * the engine regardless of this flag.
+     */
+    enableMarket?: boolean;
 }
 
 export default class ScreepsServer extends EventEmitter {
@@ -153,6 +163,17 @@ export default class ScreepsServer extends EventEmitter {
             }
             await fs.writeFileAsync(modsPath, JSON.stringify(modsJson, null, '\t'));
         }
+        if (this.opts.enableMarket) {
+            // Mods are required relative to the mods.json directory; an absolute path
+            // resolves as-is (see @screeps/common config-manager).
+            const marketEntry = require.resolve(MARKET_MOD);
+            const modsPath = path.resolve(this.opts.path, MOD_FILE);
+            const modsJson = JSON.parse(await fs.readFileAsync(modsPath, 'utf8') as string);
+            if (!modsJson.mods.includes(marketEntry)) {
+                modsJson.mods.push(marketEntry);
+            }
+            await fs.writeFileAsync(modsPath, JSON.stringify(modsJson, null, '\t'));
+        }
         // Start storage process
         this.emit('info', 'Starting storage process.');
         const library = path.resolve(path.dirname(require.resolve('@screeps/storage')), '../bin/start.js');
@@ -206,6 +227,64 @@ export default class ScreepsServer extends EventEmitter {
         await driver.notifyRoomsDone(gameTime);
         await (driver.config as any).mainLoopCustomStage();
         return this;
+    }
+
+    /*
+        Deterministically (re)create NPC market buy/sell orders.
+
+        screepsmod-market normally creates NPC orders from a backend cronjob on a wall-clock
+        timer; the mockup runs no cronjobs, so this drives the mod's own generator directly
+        against the database instead. One buy and one sell order is upserted per resource
+        (from config.market) for every NPC-owned terminal (rooms.objects of type 'terminal'
+        with user == null). Prices/amounts come from the mod defaults and may be overridden
+        via a `market.yml` in the process cwd.
+
+        Requires the server to have been created with { enableMarket: true }.
+        Returns the full list of market orders after the update.
+    */
+    async recreateNpcMarketOrders(): Promise<any[]> {
+        if (!this.opts.enableMarket) {
+            throw new Error('recreateNpcMarketOrders() requires the server to be started with { enableMarket: true }');
+        }
+        // Loading the mod against a config with a truthy `backend` makes it (a) populate
+        // config.market with NPC price/amount defaults (and any market.yml overrides) and
+        // (b) register its NPC-order cron. We invoke that cron directly rather than waiting
+        // for the backend timer.
+        //
+        // The mod writes orders via `db.update(query, bareDoc, { upsert })`, relying on
+        // bare-document replacement semantics. @screeps/storage only applies update
+        // operators ($set, $merge, ...) — a bare doc is ignored, so price/amount/etc. would
+        // be dropped. We hand the mod a thin db proxy that rewraps its 'market.orders'
+        // writes in $set so every field persists; all other collections pass through.
+        const realDb = common.storage.db;
+        const dbShim = new Proxy(realDb, {
+            get(target: any, prop: PropertyKey, receiver: any) {
+                if (prop === 'market.orders') {
+                    const coll = target['market.orders'];
+                    return {
+                        find: (...args: any[]) => coll.find(...args),
+                        update: (query: any, doc: any, params: any) => {
+                            const fields = { ...doc };
+                            delete fields._id;
+                            return coll.update(query, { $set: fields }, params);
+                        },
+                    };
+                }
+                const value = Reflect.get(target, prop, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+        });
+
+        // eslint-disable-next-line global-require, import/no-dynamic-require
+        const marketMod = require(require.resolve(MARKET_MOD));
+        const modConfig: any = { common: { storage: { db: dbShim } }, backend: {}, cronjobs: {} };
+        marketMod(modConfig);
+        const cron = modConfig.cronjobs.recreateNpcOrders;
+        if (!cron) {
+            throw new Error('screepsmod-market did not register its NPC-order cronjob');
+        }
+        await cron[1]();
+        return common.storage.db['market.orders'].find({});
     }
 
     /*
