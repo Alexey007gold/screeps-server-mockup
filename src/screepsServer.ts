@@ -60,6 +60,7 @@ export default class ScreepsServer extends EventEmitter {
     _guiBotUsernames: string[];
     _guiBotBadges: Record<string, object>;
     private _guiSteamId?: string;
+    private _stopPromise?: Promise<any>;
 
     private usersQueue?: any;
     private roomsQueue?: any;
@@ -434,24 +435,34 @@ export default class ScreepsServer extends EventEmitter {
 
     /*
         Stop most processes (it is not perfect though as some remain).
+        Idempotent: repeat calls return the first call's promise.
     */
     stop(): Promise<any> {
+        if (this._stopPromise) return this._stopPromise;
         const engineProcs = Object.entries(this.processes)
             .filter(([name]) => name !== 'storage')
             .map(([, proc]) => proc);
         engineProcs.forEach(p => p.kill());
-        const enginesDone = Promise.all(engineProcs.map(proc =>
-            new Promise<void>((resolve) => {
-                if ((proc as any).exitCode !== null) { resolve(); return; }
-                proc.once('exit', resolve);
-            })
-        ));
+        const enginesDone = Promise.all(engineProcs.map(proc => this.whenExited(proc)));
 
         if (this.opts.gui) {
             const backend: any = require('@screeps/backend');
-            return Promise.all([enginesDone.then(() => this.stopStorage()), backend.stop()]);
+            this._stopPromise = Promise.all([enginesDone.then(() => this.stopStorage()), backend.stop()]);
+        } else {
+            this._stopPromise = enginesDone.then(() => this.stopStorage());
         }
-        return enginesDone.then(() => this.stopStorage());
+        return this._stopPromise;
+    }
+
+    /*
+        A signal-terminated child keeps exitCode === null (only signalCode is set),
+        so both must be checked to detect an already-exited process.
+    */
+    private whenExited(proc: cp.ChildProcess): Promise<void> {
+        return new Promise<void>((resolve) => {
+            if ((proc as any).exitCode !== null || (proc as any).signalCode !== null) { resolve(); return; }
+            proc.once('exit', () => resolve());
+        });
     }
 
     private stopStorage(): Promise<void> {
@@ -461,9 +472,6 @@ export default class ScreepsServer extends EventEmitter {
         storage._socket?.destroy();
         storage._connected = false;
         storageProc.kill();
-        return new Promise<void>((resolve) => {
-            if ((storageProc as any).exitCode !== null) { resolve(); return; }
-            storageProc.once('exit', resolve);
-        });
+        return this.whenExited(storageProc);
     }
 }
